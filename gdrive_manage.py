@@ -1,28 +1,61 @@
 # This scrypt is for syncing a local directory with a directory on
-# Google Drive. Takes two arguments: the local directory absolute path
-# and the google drive os-like path, i.e. a path relative to the
+# Google Drive. Takes three arguments: the local directory absolute path
+# the google drive os-like path, i.e. a path relative to the
 # Google Drive root <foldername>/<innerfolder>/...
+# and a list of objects to not sync
 # With flag -n a new gdrive directory will be created instead of
 # searching an existing one
 
+# The logic of syncing - go over either local or gdrive files.
+# If anything is newer on a local machine - upload it to gdrive,
+# if anything is newer on gdrive - download to a local machine.
+# But we have to deal with file removal as well
+# So, basically we have three cases:
+# 1. Something is deleted locally - absent on local machine
+# but exists on gdrive
+# 2. Something was added directly to gdrive - also absent on
+# local machine but exsts on gdrive
+# 3. Something was directly deleted from gdrive - it's on
+# the local machine, but not on gdrive and should be deleted
+# from local machine
+# - Solution for 2 is easy: 
+# A helper file will be created on gdrive root. This file will
+# contain the timestamp, when data was synced last time.
+# Thus if there is something not existing locally, but it's
+# newer that last sync timestamp, it should be copied locally
+# - Solution for 1 and 3 isn't that simple.
+# Probably the easiest way is to not delete anything from
+# gdrive manually but we go the other way - sync direction.
+# By default it will be "to gdrive", so nothing will be deleted
+# on a local machine. If it's set "to local", then nothing
+# will be deleted from gdrive
+# The best option to use it - put syncing "to gdrive" on
+# autolaunch, and "to local" at button press. So if during
+# a day there were some deletions from gdrive, just press
+# a button in another location.
 
+import logging
 import subprocess
-from os import path, listdir
+from os import path, listdir, remove, mkdir, utime
+from os import name as os_name
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import TransportError, RefreshError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
+from io import FileIO, BytesIO
 from httplib2 import ServerNotFoundError
-from datetime import datetime
+from datetime import datetime, UTC
 from concurrent.futures import TimeoutError
 from time import sleep, time
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
+from typing import Literal
+from shutil import rmtree
+from datetime import datetime
 
-DEBUG = False
-
+# ================= globals ==================
 GOOGLE_LOGIN = {
     # The CLIENT_SECRETS_FILE variable specifies the name of a file that contains
     # the OAuth 2.0 information for this application, including its client_id and
@@ -33,83 +66,92 @@ GOOGLE_LOGIN = {
     # If modifying these scopes, delete the file token.json.
     'scopes': ['https://www.googleapis.com/auth/drive']
 }
+# =============== end globals ================
 
-class Onetier:
+class IgnoreThose:
+    """this class is for storing paths to files or folders to ignore.
+    Type of ignored objects can be specified: 'single_file',
+    'all_files' but not folders in a given folder, whole 'folder'.
+    """
+    def __init__(
+        self,
+        rel_path: str,
+        obj_type: Literal['single_file', 'all_files', 'folder']
+    ) -> None:
+        # exclude a situation when the whole syncing folder is excluded
+        # it's a pure usage mistake
+        if not rel_path and obj_type == 'folder':
+            raise ValueError('"rel_path" for ignoring is pointing to the root folder, nothing to sync')
+        # preserve the ignored object type
+        self.obj_type = obj_type
+        # strip slashes
+        if os_name == 'posix':
+            rel_path = rel_path.strip('/')
+        else:
+            rel_path = rel_path.strip('\\')
+        # preserve the whole rel_path
+        self.rel_path = rel_path
+        # for a single file or a folder the given path contains
+        # both - obj name and obj relative path
+        # we aren't preserving memory, so let's prepare all the
+        # parts may be required
+        if obj_type == 'all_files':
+            # there isn't some object, we ignoring all files
+            self.obj_name = None
+            self.parents = rel_path
+        else:
+            # extract the last item from the path, it's the
+            # object name and it' path
+            self.obj_name = path.basename(rel_path)
+            self.parents = path.dirname(rel_path)
+        # tier to ease the search
+        self.tier = len(self.parents)
+        
+class OneLocalTier:
     """this class is meant to store lists of filenames and
     directory names in some direcorty and parents as a relative path
+    for a local folder
     """
-    def __init__(self, parents: str='', gparent: str|None = None) -> None:
+    def __init__(self, parents: str='') -> None:
         """files and dirs are initialized as empty lists, so
         elements can be added there in a loop. tier is the amount
         of parents, i.e. the amount of directories in relative path
 
         Args:
-            parents (str, optional): just additional information.
-                        relative path on gdrive
-            gparent (str|None, optional): for gdrive items only,
-                        because they have and relative path which is
-                        for a user and parent folder id, which is for API
+            parents (str, optional): relative path to a file or directory
+                        in the set root directory
         """
         self.files = []
         self.dirs = []
         self.parents = parents
-        self.tier = 0 if not parents else len(parents.split('/'))
-        self.gparent = gparent
-    
-def iterate_dircontent(dir) -> list[Onetier]:
-    """returns Onetier object for each directory in a tree.
-    For files - adds up a file modification type in a tuple
-    (filename, mtime).
+        # strip all slashes except those which is inside a path
+        # get tier lvl (tier 0, tier 1) counting it's parents
+        if parents == '':
+            self.tier = 0
+        elif os_name == 'nt':
+            self.tier = len(parents.strip('\\').split('\\'))
+        else:
+            self.tier = len(parents.strip('/').split('/'))
 
-    Args:
-        dir (_type_): an absolute path to a root directory
-                    for which this function returns lists of
-                    contents
-
-    Returns:
-        list[Onetier]: Onetier for each directory, the root 'dir'
-                    including
+class OneGDriveTier(OneLocalTier):
+    """this class is meant to store lists of filenames and
+    directory names in some direcorty and parents on gdrive
     """
-    if DEBUG:
-        print('Creating local structure')
-    dirs_to_visit = [] # dirs to make Onetier for each
-    result = [] # total result
-    def one_tier_files(parents: str) -> None:
-        """gets non resursive contents of one directory, stores
-        it into a Onetier object, adds the object to totale result,
-        adds directories to dirs_to_visit if there are any
+    def __init__(self, parents: str='', gparent: str='', synced: bool = False) -> None:
+        """
+        Takes two more parameters:
+
+        "gparent" for gdrive items only, because they have relative path which is
+        for a user and parent folder id, which is for API requests
+        "synced" the idea is to go over local directories and sync all it's
+        content with gdrive, marking such folders as synced. All remaining
+        directories have to be copied to the local machine
 
         Args:
-            parents (str): relative 'shift' inside the root dir
-
-        Returns: nothing, because modifies variables of parent func
+            gparent (str|None, optional): tier parent folder id
         """
-        for_return = Onetier(parents=parents)
-        current_dir = path.join(dir, parents) # get abs path
-        # loop over all items in a directory
-        for item in listdir(current_dir):
-            item_full = path.join(current_dir, item) # get abs path of an item
-            # skip links. They are dangerous and not needed on gdrive
-            if path.islink(item_full):
-                continue
-            # add files as tuples with their modification times
-            if path.isfile(item_full):
-                for_return.files.append((item, path.getmtime(item_full)))
-                continue
-            # add dir to the result and to the list of dirs to visit
-            if path.isdir(item_full):
-                for_return.dirs.append(item)
-                dirs_to_visit.append((parents, item))
-        result.append(for_return)
-    
-    # call for the root dir
-    one_tier_files('')
-    # loop over all other dirs with any nesting inside the root dir
-    while dirs_to_visit:
-        one_tier_files(path.join(*dirs_to_visit.pop(0)))
-    if DEBUG:
-        print('Created local structure')
-    return result
+        super().__init__(parents)
+        self.gparent = gparent
 
 class GdriveSync:
     def __init__(
@@ -117,16 +159,45 @@ class GdriveSync:
         client_secrets_file: str,
         token_file: str,
         scopes: list[str],
-        folder: str='',
-        create_folder: bool=False
+        local_folder:str,
+        gdrive_folder: str='',
+        create_folder: bool=False,
+        sync_direction: Literal['local_to_gdrive', 'gdrive_to_local']='local_to_gdrive',
+        ignored_objects: list[IgnoreThose]|None = None
     ) -> None:
         self.client_secrets_file = client_secrets_file
         self.token_file = token_file
         self.scopes = scopes
-        self.folder = folder.strip('/')
+        # folder name gdrive given by it's human readable path
+        self.gdrive_folder = gdrive_folder.strip('/')
+        # gdrive folder id, after it will be found or created
+        self.gdrive_folder_id = None
+        # a local folder to sync
+        self.local_folder = local_folder
+        # a flag to create a new folder
         self.create_folder = create_folder
         self.creds = None
         self.service = None
+        # file, containing names and dates of synced directories
+        self.last_sync_file_name = 'sync_data.txt'
+        # file id on gdrive. Stays None if it wasn't found
+        self.last_sync_file_id = None
+        # it's not enough to find a file and get it's
+        # content. It should also have the data about the
+        # folder to sync, i.e. self.folder and it's sync time
+        # set a default of a smallest valuable
+        self.last_sync_time = 0
+        # prepare for gdrive folder structure
+        self.gdrive_struct = []
+        # prepare for local structure
+        self.local_struct = []
+        # store stuff to ignore
+        self.ignored_objects = ignored_objects
+        self.sync_direction = sync_direction
+        # when a folder has to be deleted, but has a file
+        # newer than last sync time, the whole dir should be
+        # restored
+        self.restore_dirs = []
 
     def make_creds(self) -> None:
         """Takes care of OAuth2 authentification. Checks the token
@@ -171,29 +242,6 @@ class GdriveSync:
         # make service
         if self.service is None:
             self.service = build('drive', 'v3', credentials=self.creds)
-
-    def create_gdrive_folder(self, folder_name: str, parent_folder_id: str|None=None) -> str:
-        """creates a folder on gdrive with given name and parent id
-
-        Args:
-            folder_name (str): a name of a folder to create
-            parent_folder_id (str | None, optional): parent folder id.
-
-        Returns:
-            str: newly created forlder id
-        """
-        if DEBUG:
-            print(f'Creating folder {folder_name}')
-        self.make_creds() # always check
-        folder_metadata = {
-            'name': folder_name,
-            'mimeType': 'application/vnd.google-apps.folder' # type folder
-        }
-        if parent_folder_id:
-            # list is required but more than one item is deprecated
-            folder_metadata['parents'] = [parent_folder_id]
-        new_folder = self.service.files().create(body=folder_metadata, fields='id').execute()
-        return new_folder['id']
     
     def _get_folder_parent(self, item_id: str) -> str:
         """requests an id if a parent folder to item 'item_id'. Item can
@@ -205,8 +253,7 @@ class GdriveSync:
         Returns:
             str: an id of the item't parent
         """
-        if DEBUG:
-            print(f'Getting folder parent of {item_id}')
+        logger.debug(f'Getting folder parent of {item_id}')
         self.make_creds()
         directory = self.service.files().get(fileId=item_id, fields='parents').execute().get('parents', [])
         # returns an array, and parent always exists, unless we ask for
@@ -223,24 +270,26 @@ class GdriveSync:
                         to True if the directory was found on gdrive and
                         False if created, and str - the directory id
         """
-        if DEBUG:
-            print(f'Searching sync directory {self.folder} on gdrive')
+        logger.info(f'Searching sync directory {self.gdrive_folder} on gdrive')
         self.make_creds() # always check
         dir_exists = True # init with assumption we'll find the dir
         # gdrive doesn't support os-like paths, so we have to check
         # the existence of every item in the path chain
-        folder_chain = self.folder.split('/')
+        folder_chain = self.gdrive_folder.split('/')
         parent_folder_id = 'root' # search start point
         while folder_chain:
             folder_name = folder_chain.pop(0) # get the topmost element
             # query to request a folder with required name and parent
-            query = f"'{parent_folder_id}' in parents and name='{folder_name}' and trashed=false and mimeType = 'application/vnd.google-apps.folder'"
-            results = self.service.files().list(q=query, fields='files(id)').execute().get('files', [])
+            results = self.search_by_name(name=folder_name, parent_folder_id=parent_folder_id, obj_type='folder')
+            # query = f"'{parent_folder_id}' in parents and name='{folder_name}' and trashed=false and mimeType = 'application/vnd.google-apps.folder'"
+            # results = self.service.files().list(q=query, fields='files(id)').execute().get('files', [])
             # if found, then we can go deeper by the chain
             if results:
-                # two folders can't have the same name, so there always
-                # be not more than one element in the returned list
-                parent_folder_id = results[0]['id']
+                # there can be two folders with the same name
+                # but hopefully it's not our situation
+                # otherwise it's not distinguisheable
+                # taking the first one
+                parent_folder_id = results[0]
             # if not found, then create the rest of the absent chain
             else:
                 dir_exists = False
@@ -250,35 +299,29 @@ class GdriveSync:
                 for item in folder_chain:
                     parent_folder_id = self.create_gdrive_folder(item, parent_folder_id)
                 break
-        if DEBUG:
-            print(f'Found folder {self.folder} on gdrive')
+        logger.info(f'Found sync directory {self.gdrive_folder} on gdrive')
         return (dir_exists, parent_folder_id)
 
-    def _iterate_gdrive(self, folder_id: str) -> list[Onetier]:
-        """Takes folder_id as a starting point and returns the
-        gdrive structure, consisting of Onetier objects with the
-        gparent field, which is the actual id of the folder
+    def _iterate_gdrive(self, folder_id: str) -> None:
+        """Takes folder_id as a starting point and gathers the
+        gdrive structure to self.gdrive_struct, consisting of
+        OneGDriveTier objects
 
         Args:
             folder_id (str): id of the folder on gdrive to make
                         the structure of
-
-        Returns:
-            list[Onetier]: a list of contents of every folder
         """
-        if DEBUG:
-            print('Start creating gdrive structure')
+        logger.debug('Start creating gdrive structure')
         self.make_creds() # always check
         parent_folder_id = folder_id # starting point
         parent_name = '' # relative root for os-like path
         dirs_to_visit = [] # nested dirs
-        result = [] # tital result
         def one_tier_files() -> None:
-            """Processes one folder, creating the Onetier object.
+            """Processes one folder, creating the OneGDriveTier object.
             Doesn't take or return anything because operates with
             it's parent function variables
             """
-            for_return = Onetier(parents=parent_name, gparent=parent_folder_id) # init new
+            for_return = OneGDriveTier(parents=parent_name, gparent=parent_folder_id) # init new
             # request the information about all contents of the folder
             current_dir = self.service.files().list(
                 q=f"'{parent_folder_id}' in parents and trashed=false", fields="files(id, name, mimeType, modifiedTime)", pageSize=1000
@@ -292,9 +335,10 @@ class GdriveSync:
                     dirs_to_visit.append((item['name'], item['id'], parent_name))
                     continue
                 # if a file, then preserve it's name, id and modification time, converted to timestamp
+                # but cut off numbers after dot via int
                 else:
-                    for_return.files.append((item['name'], item['id'], datetime.fromisoformat(item['modifiedTime']).timestamp()))
-            result.append(for_return) # add new Onetier to the result
+                    for_return.files.append((item['name'], item['id'], int(datetime.fromisoformat(item['modifiedTime']).timestamp())))
+            self.gdrive_struct.append(for_return) # add new OneGDriveTier to the result
         # call for the root dir
         one_tier_files()
         # loop over all other dirs with any nesting inside the root dir
@@ -302,9 +346,245 @@ class GdriveSync:
             dir_name, parent_folder_id, tmp_parent = dirs_to_visit.pop(0)
             parent_name = path.join(tmp_parent, dir_name)
             one_tier_files()
-        if DEBUG:
-            print('Finished creating gdrive structure')
-        return result
+        logger.debug('Finished creating gdrive structure')
+
+    def _iterate_localdir(self) -> None:
+        """returns OneLocalTier object for each directory in a tree.
+        For files - adds up a file modification type in a tuple
+        (filename, mtime). Stores the gathered results in
+        self.local_struct
+
+        Args:
+            dir (_type_): an absolute path to a root directory
+                        for which this function returns lists of
+                        contents
+        """
+        logger.debug('Creating local structure')
+        dirs_to_visit = [] # dirs to make OneLocalTier for each
+        # --------------- innder func ----------------
+        def one_tier_files(parents: str) -> None:
+            """gets non resursive contents of one directory, stores
+            it into a OneLocalTier object, adds the object to totale result,
+            adds directories to dirs_to_visit if there are any
+
+            Args:
+                parents (str): relative 'shift' inside the root dir
+
+            Returns: nothing, because modifies variables of parent func
+            """
+            for_return = OneLocalTier(parents=parents)
+            current_dir = path.join(self.local_folder, parents) # get abs path
+            # loop over all items in a directory
+            for item in listdir(current_dir):
+                item_full = path.join(current_dir, item) # get abs path of an item
+                # skip links. They are dangerous and not needed on gdrive
+                if path.islink(item_full):
+                    continue
+                # add files as tuples with their modification times with cut off
+                # nimbers after a dot
+                if path.isfile(item_full):
+                    for_return.files.append((item, int(path.getmtime(item_full))))
+                    continue
+                # add dir to the result and to the list of dirs to visit
+                if path.isdir(item_full):
+                    for_return.dirs.append(item)
+                    dirs_to_visit.append((parents, item))
+            self.local_struct.append(for_return)
+        # ----------- end innder func ----------------
+        # call for the root dir
+        one_tier_files('')
+        # loop over all other dirs with any nesting inside the root dir
+        while dirs_to_visit:
+            one_tier_files(path.join(*dirs_to_visit.pop(0)))
+        logger.debug('Created local structure')
+
+    def _exclude_ignored(self) -> None:
+        """takes both structures self.gdrive_struct and
+        self.local_struct and cleans them from objects
+        in self.ignored_objects (list[IgnoreThose]) - folders,
+        files in a folder or single files. It's important to clean
+        both otherwise the objects, presented in one source will be
+        copied to another or, even worse, deleted from the first.
+        """
+        logger.debug('Excluding ignored things')
+        # --------------- innder func ----------------
+        def exclude_one(
+                struct: list[OneGDriveTier]|list[OneLocalTier],
+                item_to_exclude: IgnoreThose
+        ) -> None:
+            """a helper function. Does all the job to exclude stuff
+
+            Args:
+                struct (list[OneGDriveTier] | list[OneLocalTier]): a struct
+                item_to_exclude (IgnoreThose): item to exclude
+            """
+            # if we be removing things right in for loor, it probably
+            # can be bad for it. So we store the elements
+            # (rather labels) and remove later. only for a 'folder'
+            items_to_remove = []
+            # check if there are items at all
+            if not struct:
+                return
+            # loop over item in a struct
+            for item in struct:
+                match item_to_exclude.obj_type:
+                    # if we should remove just one file
+                    case 'single_file':
+                        # find the proper item by it's path
+                        if item.parents == item_to_exclude.parents:
+                            # struct.files are tuples, we have to check first elements
+                            for file in item.files:
+                                if item_to_exclude.obj_name == file[0]:
+                                    # remove and return
+                                    item.files.remove(file)
+                                    return
+                    # ignore all files in some folder
+                    case 'all_files':
+                        # find the proper item by it's path
+                        if item.parents == item_to_exclude.parents:
+                            # empty all files
+                            item.files.clear()
+                            break
+                    # ignore a whole folder and it's subfolders with content
+                    case 'folder':
+                        # remove all subfolders
+                        if item_to_exclude.rel_path in item.parents:
+                            items_to_remove.append(item)
+                        # remove the parent folder from some_tier.dirs
+                        if item.tier == item_to_exclude.tier:
+                            for dir in item.dirs:
+                                if type(dir) is tuple:
+                                    if item_to_exclude.obj_name == dir[0]:
+                                        item.dirs.remove(dir)
+                                        break
+                                else:
+                                    if item_to_exclude.obj_name == dir:
+                                        item.dirs.remove(dir)
+                                        break
+            # remove ignored folders from a structure
+            for item in items_to_remove:
+                struct.remove(item)
+        # ----------- end innder func ----------------
+        # go over all ignoring items
+        for item_to_ignore in self.ignored_objects:
+            exclude_one(self.gdrive_struct, item_to_ignore)
+            exclude_one(self.local_struct, item_to_ignore)
+
+    def _get_last_sync_time(self) -> None:
+        """File self.last_sync_file_name is stored in the root
+        of google drive and contains rows with directory and it's
+        sync time timestamp each.
+        """
+        logger.debug(f'Reading {self.last_sync_file_name}')
+        # look for a file on the gdrive root. It should be
+        # either there with exact name or none
+        last_sync_file = self.search_by_name(name=self.last_sync_file_name, parent_folder_id=self.gdrive_folder_id)
+        # there should be just one item or None, so we can safely
+        # take the first item if the list isn't empty
+        if last_sync_file:
+            self.last_sync_file_id = last_sync_file[0]
+            # now we need file content
+            # self.download_file won't be good foor the purpose
+            # because we don't need to store it's content
+            # but to put it into a variable
+            request = self.service.files().get_media(fileId=self.last_sync_file_id)
+            fh = BytesIO()
+            # Initialise a downloader object to download the file 
+            downloader = MediaIoBaseDownload(fh, request) 
+            done = False
+            # Download the data in chunks 
+            while not done: 
+                status, done = downloader.next_chunk() 
+            # rewind stream to the beginning
+            fh.seek(0)
+            # decode from bytes. split two name and timestamp
+            file_content = fh.read().decode()
+            if not file_content.isdigit():
+                logger.error(f'Seems like file {self.last_sync_file_name} is corrupted, a new one will be created')
+                return
+            self.last_sync_time = int(file_content)
+
+    def _set_last_sync_time(self) -> None:
+        """saves file named from self.last_sync_file_name
+        to the gdrive root
+        """
+        logger.debug(f'Setting {self.last_sync_file_name}')
+        self.make_creds()
+        # get timestamp, cut off stuff after dot
+        now = int(datetime.now().timestamp())
+        # prepare inram file
+        file_data = BytesIO(str(now).encode())
+        if self.last_sync_file_id is None:
+            file_metadata = {
+                'name': self.last_sync_file_name,
+                'parents': [self.gdrive_folder_id],
+            }
+            media = MediaIoBaseUpload(file_data, mimetype='text/plain', resumable=True)
+            self.service.files().create(body=file_metadata, media_body=media).execute() 
+        else:
+            media = MediaIoBaseUpload(file_data, mimetype='text/plain', resumable=True)
+            self.service.files().update(fileId=self.last_sync_file_id, media_body=media).execute()        
+
+# ========== manipulate gdrive ===============
+    def create_gdrive_folder(self, folder_name: str, parent_folder_id: str|None=None) -> str:
+        """creates a folder on gdrive with given name and parent id
+
+        Args:
+            folder_name (str): a name of a folder to create
+            parent_folder_id (str | None, optional): parent folder id.
+
+        Returns:
+            str: newly created forlder id
+        """
+        logger.info(f'-> Creating folder {folder_name}')
+        self.make_creds() # always check
+        folder_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder' # type folder
+        }
+        if parent_folder_id:
+            # list is required but more than one item is deprecated
+            folder_metadata['parents'] = [parent_folder_id]
+        new_folder = self.service.files().create(body=folder_metadata, fields='id').execute()
+        return new_folder['id']
+
+    def search_by_name(self,
+                       name: str,
+                       parent_folder_id: str|None=None,
+                       obj_type: Literal['file', 'folder', 'any']='file'
+        ) -> list[str]:
+        """Searches a given name on google drive, returns a list of
+        IDs or an empty list if none was found.
+
+        Args:
+            file_name (str): a name of an object to look for, can
+                        be partial
+            parent_folder_id (str, optional): to search in exact folder.
+                        Can be either folder id, root or None to
+                        search everywhere
+            obj_type (Literal['file', 'folder', 'any'], optional): to search
+                        only files or folders, or any type
+
+        Returns:
+            list[str]: a list if IDs of found objects
+        """
+
+        logger.debug(f'Searching id for {name}')
+        self.make_creds() # always check
+        # assembling a query
+        query = ''
+        if parent_folder_id is not None:
+            query += f"'{parent_folder_id}' in parents and "
+        if obj_type == 'file':
+            query += "mimeType!='application/vnd.google-apps.folder' and "
+        elif obj_type == 'folder':
+            query += "mimeType='application/vnd.google-apps.folder' and "
+        query += f"name contains '{name}' and trashed=false"
+        results = self.service.files().list(q=query, fields='files(id)').execute()
+        for_return = []
+        for item in results['files']:
+            for_return.append(item['id'])
+        return for_return
 
     def delete_file_or_folder(self, file_id: str) -> None:
         """Deletes an object with said id on gdrive
@@ -312,23 +592,21 @@ class GdriveSync:
         Args:
             file_id (str): id of an object to delete
         """
-        if DEBUG:
-            print(f'Deleting {file_id}')
+        logger.info(f'x-> Deleting {file_id}')
         self.make_creds()
         try:
             self.service.files().delete(fileId=file_id).execute()
         except HttpError:
-            print(f'{file_id} отсутствует')
+            logger.error(f'{file_id} отсутствует')
 
     def batch_delete_files(self, files_to_delete: list) -> None:
         """Deletes all objects in the list in one request
 
         Args:
-            files_to_delete (list): a list of ids of objects
+            files_to_delete (list): a list of IDs of objects
                         to delete
         """
-        if DEBUG:
-            print(f'Batch deleting {files_to_delete}')
+        logger.info(f'x-> Batch deleting {files_to_delete}')
         if not files_to_delete:
             return
         self.make_creds()
@@ -342,140 +620,340 @@ class GdriveSync:
         """Updates the existing gdrive file
 
         Args:
-            local_path (str): the path to the file in fs
+            local_path (str): path to the file relative to the
+                        syncing folder
             file_id (str): id of a file on gdrive
         """
-        if DEBUG:
-            print(f'Updating file {path.basename(local_path)}')
+        logger.info(f'-> Updating file {path.basename(local_path)}')
         self.make_creds()
-        media = MediaFileUpload(local_path, resumable=True)
+        media = MediaFileUpload(path.join(self.local_folder, local_path), resumable=True)
         self.service.files().update(fileId=file_id, media_body=media).execute()
 
 
-    def upload_file(self, file_to_upload: str, parent: str='root') -> None:
+    def upload_file(self, local_path: str, mtime: float, parent: str='root') -> None:
         """Uploads a new file to gdrive. If a file with such name
         exists, it will be uploaded as a separate file regardless
 
         Args:
-            file_to_upload (str): the path to the file in fs
+            file_to_upload (str): path to the file relative to the
+                        syncing folder
             parent (str, optional): folder id on gdrive where
                         the file will be located
         """
-        if DEBUG:
-            print(f'Uploading file {path.basename(file_to_upload)}')
+        logger.info(f'-> Uploading file {path.basename(local_path)}')
         self.make_creds()
+        # modified_time = datetime.utcfromtimestamp(mtime).replace(tzinfo=timezone.utc).isoformat()
+        modified_time = datetime.fromtimestamp(mtime, UTC).isoformat()
         file_metadata = {
-            'name': path.basename(file_to_upload),
-            'parents': [parent]
+            'name': path.basename(local_path),
+            'parents': [parent],
+            'modifiedTime': modified_time
         }
-        media = MediaFileUpload(file_to_upload, resumable=True)
+        media = MediaFileUpload(path.join(self.local_folder, local_path), resumable=True)
         self.service.files().create(body=file_metadata, media_body=media).execute()
 
-    def _compare_flat(self, local: Onetier, gdrive: Onetier, local_dir: str) -> list:
-        """Compares two Onetier objects, and makes all necessary changes
-        to reflect local directory to gdrive directory
+    def download_file(self, local_path: str, file_id_to_download: str) -> None:
+        """Downloads a file, which exists on gdrive, but not locally.
+        Takes it's name from gdrive
 
         Args:
-            local (Onetier): local directory
-            gdrive (Onetier): gdrive directory
-            local_dir (str): absolute path too the local directory in fs
-
-        Returns:
-            list: a list of Onetier objects, i.e. new gdrive folders
-                        which were created in a process of reflecting
-                        and should be added to the gdrive structure
+            file_id_to_download (str): id of a file on gdrive
+            local_path (str): a local path where a file should
+                        be located, relative to the syncing dir
         """
-        if DEBUG:
-            print(f'Comparing tier {local.parents}')
+        self.make_creds()
+        # Request the file metadata: kind - file or dir, id, name, mimeType
+        # we need name here
+        file_metadata = self.service.files().get(fileId=file_id_to_download, fields='modifiedTime,name').execute()
+        file_name = file_metadata['name']
+        file_mtime = datetime.fromisoformat(file_metadata['modifiedTime']).timestamp()
+        file_path_local = path.join(self.local_folder, local_path, file_name)
+        # Download the file
+        request = self.service.files().get_media(fileId=file_id_to_download)
+        # save file to sync folder + inner path + file name
+        fh = FileIO(file_path_local, 'wb')
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            logger.info(f"<- Downloading file {file_name} - {int(status.progress() * 100)}%")
+        # set file mtime, otherwise it looks newer than on gdrive
+        utime(file_path_local, (file_mtime, file_mtime))
+# ======== end manipulate gdrive =============
+
+    def _compare_flat(
+            self,
+            one_local: OneLocalTier,
+            one_gdrive: OneGDriveTier,
+            local_dir: str,
+        ) -> None:
+        """Compares two One...tier objects, and makes all necessary changes
+        to reflect local directory to gdrive directory and vice versa
+
+        Args:
+            one_local (OneLocalTier): local directory
+            one_gdrive (OneGDriveTier): gdrive directory
+            local_dir (str): absolute path to the local directory in fs
+        """
+        # --------------- innder func ----------------
+        def find_newest_file(struct: list[OneLocalTier]|list[OneGDriveTier], rel_path: str) -> int:
+            """_summary_
+
+            Args:
+                struct (list[OneLocalTier]|list[OneGDriveTier]): self.local_struct
+                            or self.gdrive_struct
+                rel_path (str): relative path to a folder inside syncing folder,
+                            i.e. inside self.local_folder
+
+            Returns:
+                int: timestamp of newest file
+            """
+            # as a starting point take 0
+            newest_timestamp = 0
+            for item in struct:
+                # if it's not inside a folder of interest
+                if not rel_path in item.parents:
+                    continue
+                # for all files in a folder of interest
+                for file in item.files:
+                    # depends on type we take an item from a tuple
+                    if type(item) is OneLocalTier:
+                        curr_file_timestamp = file[1]
+                    else:
+                        curr_file_timestamp = file[2]
+                    # save the one is bigger
+                    if curr_file_timestamp > newest_timestamp:
+                        newest_timestamp = curr_file_timestamp
+            return newest_timestamp
+        # ----------- end innder func ----------------
+        logger.debug(f'Comparing dir {one_local.parents if one_local.parents else "root"}')
         files_to_delete = [] # for bacth delete
-        new_struct_items = [] # new folders created, for returning
         # go over all files in a local dir
-        while local.files:
-            local_file, local_mtime = local.files.pop()
+        while one_local.files:
+            local_file, local_mtime = one_local.files.pop()
             # go over all files in a gdrive dir
-            for item in gdrive.files:
+            for item in one_gdrive.files:
                 g_name, g_id, g_mtime = item
                 # if the same file name found
                 if g_name == local_file:
                     # check if the local file is newer
                     if local_mtime > g_mtime:
                         # if so - update gdrive file
-                        self.update_file(path.join(path.join(local_dir, local.parents), local_file), g_id)
+                        self.update_file(path.join(one_local.parents, local_file), g_id)
+                    # check if a remote file is newer
+                    elif g_mtime < local_mtime:
+                        # download it to the folder, consisting of a root dir of syncing folder
+                        # and it's relative path inside
+                        self.download_file(one_local.parents, g_id)
                     # remove the processed file from gdrive list
-                    gdrive.files.remove(item)
+                    one_gdrive.files.remove(item)
                     break
-            # if a file not found, means it's absent on gdrive, upload it
+            # if a file not found, means it's absent on gdrive
+            # thus it should be uploaded if the sync direction is
+            # 'local_to_gdrive' or a file is newer than last sync time
+            # otherwise deleted locally
             else:
-                self.upload_file(path.join(path.join(local_dir, local.parents), local_file), gdrive.gparent)
+                if self.sync_direction == 'local_to_gdrive' or local_mtime > self.last_sync_time:
+                    if self.sync_direction == 'gdrive_to_local':
+                        logger.info(f'Local file {path.join(self.local_folder, one_local.parents, local_file)} is '
+                              'newer than last sync time. Thus regardless of sync direction "gdrive to local" '
+                              'the file will be uploaded')                    
+                    self.upload_file(path.join(one_local.parents, local_file), local_mtime, one_gdrive.gparent)
+                else:
+                    local_file_to_del = path.join(self.local_folder, one_local.parents, local_file)
+                    logger.info(f'Deleting local file {local_file_to_del}')
+                    remove(local_file_to_del)
         # if anything remins in the list of gdrive files, means these files
-        # are absent locally and should be deleted
-        for item in gdrive.files:
-            files_to_delete.append(item[1])
-        # loop over local dirs
-        while local.dirs:
-            local_dir = local.dirs.pop()
-            # loop over gdrive dirs
-            for item in gdrive.dirs:
-                g_name, g_id = item
-                # if directory exists on gdrive
-                if g_name == local_dir:
-                    # remove a processed one from the list
-                    gdrive.dirs.remove(item)
-                    break
-            # if no such dir, then create it and create a corresponding empty Onetier object
+        # are absent locally and should be deleted on grdive if sync is
+        # 'local_to_gdrive' unless they are newer than last sync time
+        # if newer or sync direction is 'gdrive_to_local', than download it
+        for item in one_gdrive.files:
+            g_name, g_id, g_mtime = item
+            if g_mtime > self.last_sync_time or self.sync_direction == 'gdrive_to_local':
+                if self.sync_direction == 'local_to_gdrive':
+                    logger.info(f'File {path.join(one_local.parents, g_name)} was downloaded despite sync direction '
+                          'is "local to gdrive" because its absent locally and newer than last sync time')
+                # download newer file
+                self.download_file(one_local.parents, g_id)
+            # or delete from gdrive
             else:
-                new_folder = self.create_gdrive_folder(local_dir, gdrive.gparent)
-                new_struct_items.append(Onetier(parents=path.join(local.parents, local_dir), gparent=new_folder))
-        # remove the remaining on gdrive dirs, which were not found locally
-        for item in gdrive.dirs:
-            files_to_delete.append(item[1])
+                files_to_delete.append(g_id)
+        # loop over local dirs
+        while one_local.dirs:
+            local_dir = one_local.dirs.pop()
+            # loop over gdrive dirs
+            for item in one_gdrive.dirs:
+                g_name, g_id = item
+                # if directory exists on gdrive and locally
+                # that's good, can stop to search and remove dir
+                if g_name == local_dir:
+                    one_gdrive.dirs.remove(item)
+                    break
+            # dir exists locally, but not on gdrive
+            else:
+                inner_dir_rel_path = path.join(one_local.parents, local_dir)
+                # in a case 'local_to_gdrive' we create a folder of current tier
+                # and the rest will be created later diring common sync process
+                # or if it's newer than last sync time, despite 'gdrive_to_local'
+                # we also create a folder, but preserve the path for uploading later
+                if (self.sync_direction == 'local_to_gdrive') or (
+                    find_newest_file(self.local_struct, inner_dir_rel_path) > self.last_sync_time):
+                    new_folder = self.create_gdrive_folder(local_dir, one_gdrive.gparent)
+                    # new gdrive folder which was created in a process of reflecting
+                    # and should be added to the gdrive structure; such are necessary
+                    # because inner tires of local structure can require it to exist
+                    self.gdrive_struct.append(OneGDriveTier(parents=inner_dir_rel_path, gparent=new_folder))
+                    if self.sync_direction != 'local_to_gdrive':
+                        self.restore_dirs.append(inner_dir_rel_path)
+                # if 'gdrive_to_local' then remove it from local
+                else:
+                    logger.info(f'Deleting local direcotory tree {inner_dir_rel_path}')
+                    rmtree(path.join(self.local_folder, inner_dir_rel_path))
+        # deal with remaining gdrive dirs
+        while one_gdrive.dirs:
+            g_name, g_id = one_gdrive.dirs.pop()
+            # delete dirs unless they have a file, newer than last sync
+            if self.sync_direction == 'local_to_gdrive':
+                if find_newest_file(self.gdrive_struct, path.join(one_gdrive.parents, g_name)) < self.last_sync_time:
+                    files_to_delete.append(g_id)
+                # if something is newer inside this folder on gdrive
+                # then create it locally. We should preserve gparent too
+                else:
+                    mkdir(path.join(self.local_folder, one_gdrive.parents, g_name))
+                    self.restore_dirs.append(path.join(one_gdrive.parents, g_name))
+            # 'gdrive_to_local' and dir exists only on gdrive
+            # a folder has to be created
+            else:
+                mkdir(path.join(self.local_folder, one_gdrive.parents, g_name))
+                # maybe not required
+                self.local_struct.append(OneLocalTier(path.join(one_gdrive.parents, g_name)))
         # delete all objects marked for this
-        self.batch_delete_files(files_to_delete)
-        if DEBUG:
-            print(f'Finished to compare tier {local.parents}')
-        return new_struct_items        
+        if files_to_delete:
+            self.batch_delete_files(files_to_delete)
+        logger.debug(f'Finished to compare tier {one_local.parents}')
 
-    def sync(self, local_dir: str, local_struct: list[Onetier]) -> None:
+    def sync(self) -> None:
         """Syncs the local and gdrive directory
-
-        Args:
-            local_dir (str): absolute path to the local directory
-            local_struct (list[Onetier]): structure, made of Onetier
-                        objects for this local directory
         """
-        if DEBUG:
-            print('Start syncing')
-        exists, root_gdir = self._search_sync_dir()
+        # --------------- innder func ----------------
+        def tier_maker(
+                struct: list[OneGDriveTier]|list[OneLocalTier]
+            ) -> dict[int,list[OneGDriveTier]|list[OneLocalTier]]:
+            """
+            split the structure by it's tiers, where tier -
+            is the level of nesting. If 'tires' already contains element
+            of a current tier, then add the current one to the list,
+            else, add it as a new dict element
+            the result be like: tiers = {0: [OneLocalTier obj, OneLocalTier obj],
+            1: [OneLocalTier obj], 2: [OneLocalTier obj, OneLocalTier obj]}
+            """
+            tiers = {}
+            for item in struct:
+                if item.tier in tiers.keys():
+                    tiers[item.tier].append(item)
+                else:
+                    tiers[item.tier] = [item]     
+            return tiers
+        # ----------- end innder func ----------------
+        logger.debug('Start syncing')
+        # this combination looks like apure mistake, prevent data loss
+        if self.create_folder and self.sync_direction == 'gdrive_to_local':
+            logger.error('A combination of "create folder" and sync "gdrive to local" is not supported! '
+                  'It will destroy a data in local folder')
+            raise ValueError('"create folder" with sync "gdrive to local" is not supported!')
+        # gen local structure
+        self._iterate_localdir()
+        exists, self.gdrive_folder_id = self._search_sync_dir()
         # a flag to make a new folder on gdrive instead of
         # searching the existing one to sync with
         if self.create_folder and exists:
-            parent_dir = self._get_folder_parent(root_gdir)
-            new_folder_name = f'{self.folder.split("/")[-1]}_{str(int(time()))}'
-            root_gdir = self.create_gdrive_folder(new_folder_name, parent_dir)
+            parent_dir = self._get_folder_parent(self.gdrive_folder_id)
+            self.gdrive_folder = f'{self.gdrive_folder.split("/")[-1]}_{str(int(time()))}'
+            self.gdrive_folder_id = self.create_gdrive_folder(self.gdrive_folder, parent_dir)
         # get the gdrive structure
-        gdrive_struct = self._iterate_gdrive(root_gdir)
-        # split the local structure by it's tiers, where tier -
-        # is the level of nesting
-        tiers = {}
-        for item in local_struct:
-            if item.tier in tiers.keys():
-                tiers[item.tier].append(item)
-            else:
-                tiers[item.tier] = [item]
+        self._iterate_gdrive(self.gdrive_folder_id)
+        # get last sync time
+        self._get_last_sync_time()
+        # prepare sync_data file for ignoring
+        sync_file = IgnoreThose('sync_data.txt', 'single_file')
+        # remove all things which should be ignored from both structures
+        if self.ignored_objects is not None:
+            self.ignored_objects.append(sync_file)
+        else:
+            self.ignored_objects=[sync_file]
+        self._exclude_ignored()
+        # depending on the sync direction, we'll be going over
+        # local structure or gdrive structure and match the other
+        if self.sync_direction == 'local_to_gdrive':
+            struct_to_go, struct_to_match = self.local_struct, self.gdrive_struct
+        else:
+            struct_to_go, struct_to_match = self.gdrive_struct, self.local_struct
+        tiers = tier_maker(struct_to_go)
         # go from the top (root) tier to the bottom
         # it will help to cut off unnecessary brancehs
         for item in sorted(tiers.keys()): # loop over tiers starting on top
             for elem in tiers[item]: # loop over every dir on this tier
-                for g_item in gdrive_struct: # loop gdrive folders
-                    # when gdrive folder will be found (and it will be found
+                for inner_item in struct_to_match: # loop inner folders
+                    # when inner folder will be found (and it will be found
                     # if no errors happened, because any absent folder will be created
                     # with the processing of the previous tier)
-                    if elem.parents == g_item.parents:
+                    if elem.parents == inner_item.parents:
                         # reflect local structure to the grdive structure
-                        gdrive_struct.extend(self._compare_flat(elem, g_item, local_dir))
+                        if self.sync_direction == 'local_to_gdrive':
+                            self._compare_flat(elem, inner_item, self.local_folder)
+                        else:
+                            self._compare_flat(inner_item, elem, self.local_folder)
+                        # delete the processed inner element, so less loops in a future
+                        struct_to_match.remove(inner_item)
                         break
-        if DEBUG:
-            print(f'Finish syncing')
+        # download/upload remaining folders
+        # likely there are none, it's rather rare
+        # --------------------------------------
+        # here we have the opposide direction of syncing
+        # if we have 'local_to_gdrive', it means we met a
+        # way too new folder on gdrive and should download
+        # it instead of erasing.
+        # if we had 'gdrive_to_local', we should upload a
+        # folder instead of erasing
+        if self.restore_dirs:
+            struct_for_restore = []
+            # filter those to restore
+            # deleted objects aren't filtered out from struct_to_match
+            # thus we filter now those which have to be reconstructed
+            for item in struct_to_match:
+                for rel_path in self.restore_dirs:
+                    if rel_path in item.parents:
+                        struct_for_restore.append(item)
+            # split the new structure to tires
+            tiers = tier_maker(struct_for_restore)
+            # loop over every tier and every element in it
+            # they have to be recreated on the other side
+            for item in sorted(tiers.keys()):
+                for elem in tiers[item]:
+                    logger.info(f'Recreating dir {elem.parents}')
+                    # processing the opposite situation, so if general option
+                    # is 'local_to_gdrive', then for us now it's 'gdrive_to_local'
+                    if self.sync_direction == 'local_to_gdrive':
+                        # get all files, remembering that file is a tuple (name, id, mtime)
+                        for file in elem.files:
+                            self.download_file(elem.parents, file[1])
+                        for dir in elem.dirs:
+                            mkdir(path.join(self.local_folder, elem.parents, dir[0]))
+                    # 'gdrive_to_local', so it's basically 'local_to_gdrive' here
+                    else:
+                        # have to find a parent dir first.
+                        # if there were no issues before, it has to exist
+                        for dir in self.gdrive_struct:
+                            if dir.parents == elem.parents:
+                                parent_dir_id = dir.gparent
+                                break
+                        for file in elem.files:
+                            self.upload_file(path.join(elem.parents, file[0],), file[1], parent_dir_id)
+                        for dir in elem.dirs:
+                            new_folder = self.create_gdrive_folder(dir, parent_dir_id)
+                            self.gdrive_struct.append(OneGDriveTier(parents=path.join(elem.parents, dir), gparent=new_folder))
+        self._set_last_sync_time()
+        logger.debug(f'Finish syncing')
 
 def sendmessage(message: str='', timeout: str='0') -> None:
     """Sends a message to notification daemon in a separate process.
@@ -485,43 +963,105 @@ def sendmessage(message: str='', timeout: str='0') -> None:
     icon = '/home/jastix/Documents/icons/gdrive_256.png'
     subprocess.Popen(['notify-send', '-i', icon, '-t', timeout, 'gdrive sync', message])
 
+def ignore_directory_parser(arg_string: str) -> IgnoreThose:
+    """Parses the input arguments like path=<path>,type=<type>
+
+    Args:
+        arg_string (str): string containing arguments
+
+    Raises:
+        ArgumentTypeError: when arguments are in given
+                    in wrong format
+
+    Returns:
+        IgnoreThose: a class instance with proper fields
+    """
+    rel_path = ''
+    action_type = ''
+    try:
+        # split path and type
+        ignore_items = arg_string.split(',')
+        for item in ignore_items:
+            # split items around "="
+            item_parts = item.split('=')
+            if item_parts[0] == 'path':
+                rel_path = item_parts[1]
+            elif item_parts[0] == 'type':
+                action_type = item_parts[1]
+        # if both parameters are found and action type is one of the values
+        if rel_path and action_type and action_type in ['single_file', 'all_files', 'folder']:
+            return IgnoreThose(rel_path, action_type)
+    # the exception type doesn't matter here, it's pure usage mistake
+    # so in a case return didn't happen, something wrong with input values
+    except:
+        pass
+    raise ArgumentTypeError('Wrong usage, example: --ignore-directories path=<path>,'
+                            'type=<type> --ignore-directories path=<path>,type=<type>')
 
 if __name__ == '__main__':
+    logger = logging.getLogger('mylogger')
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        '{asctime} [{levelname:8}] {message}',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        style='{'
+        )
+    # handler = logging.StreamHandler()
+    handler = logging.FileHandler('sync.log', mode='a', encoding=None, delay=False)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
     retries = 3 # three attempts to sync, in case of network issues
     parser = ArgumentParser()
-    parser.add_argument('local_path')
-    parser.add_argument('gdrive_dir')
-    parser.add_argument("-n", "--new", action="store_true")
+    parser.add_argument('local_path', type=str, help='full path to a local directory')
+    parser.add_argument('gdrive_dir',type=str,
+        help='filesystem-like path on gdrive. Same pattern as for local directory')
+    # if a new gdrive folder should be created regardless of it's existance
+    parser.add_argument(
+        "-n",
+        "--new",
+        action="store_true",
+        help='If set, a new folder on gdrive will be created for syncing'
+    )
+    parser.add_argument('--sync-direction', choices=['local_to_gdrive', 'gdrive_to_local'], default='local_to_gdrive')
+    parser.add_argument('--ignore-directories', type=ignore_directory_parser, action='append',
+                    help='ignore directories with the specified path and type.'
+                    'Format: --ignore-directories path=<path>,type=<type> '
+                    '--ignore-directories path=<path>,type=<type> ... .'
+                    '<type>: single_file, all_files, folder'
+                    '<path>: RELATIVE path INSIDE the syncing directory')
     args = parser.parse_args()
-    local_dir = args.local_path
-    gdrive_dir_name = args.gdrive_dir
-    if path.exists(local_dir):
-        local_struct = iterate_dircontent(local_dir)
+    logger.debug(f'syncing with arguments:{args.local_path}, {args.gdrive_dir}, '
+                f'{args.new}, {args.sync_direction}, '
+                f'{[ (x.rel_path, x.obj_type) for x in args.ignore_directories ]}')
+    if path.exists(args.local_path):
         while retries:
             try:
-                gdrive = GdriveSync(**GOOGLE_LOGIN, folder=gdrive_dir_name, create_folder=args.new)
-                gdrive.sync(local_dir, local_struct)
-                sendmessage(f'{gdrive_dir_name} successfully synced', '10000')
-                if DEBUG:
-                    print('All done well')
+                gdrive = GdriveSync(
+                    **GOOGLE_LOGIN,
+                    local_folder=args.local_path,
+                    gdrive_folder=args.gdrive_dir,
+                    create_folder=args.new,
+                    sync_direction=args.sync_direction,
+                    ignored_objects=args.ignore_directories
+                )
+                gdrive.sync()
+                sendmessage(f'{args.gdrive_dir} successfully synced', '10000')
+                logger.info('All done well\n-----------------------')
                 break # the work is done
             # if issues are related exactly to the network then wait and retry
             except (TimeoutError, TransportError, ServerNotFoundError, RefreshError):
-                sendmessage(f'{gdrive_dir_name} wasnt synced, probably network issues, will retry', '10000')
-                if DEBUG:
-                    print('Network error, retrying')
+                sendmessage(f'{args.gdrive_dir} wasnt synced, probably network issues, will retry', '10000')
+                logger.error('Network error, retrying')
                 sleep(120)
                 retries -= 1
             except Exception as e:
-                if DEBUG:
-                    print('Unexpected error, interrupted')
-                sendmessage(f'{gdrive_dir_name} wasnt synced, an error occured: {str(e)}')
+                logger.error('Unexpected error, interrupted')
+                sendmessage(f'{args.gdrive_dir} wasnt synced, an error occured: {str(e)}')
                 break
         else:
-            if DEBUG:
-                print('Network error, out of retries')
-            sendmessage(f'{gdrive_dir_name} wasnt synced, probably network issues, retries are over')
+            logger.critical('Network error, out of retries')
+            sendmessage(f'{args.gdrive_dir} wasnt synced, probably network issues, retries are over')
     else:
-        if DEBUG:
-            print('No local folder')
-        sendmessage(f'{local_dir} doesnt exist locally')
+        logger.error('No local folder')
+        sendmessage(f'{args.local_path} doesnt exist locally')
