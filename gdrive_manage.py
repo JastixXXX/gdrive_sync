@@ -959,9 +959,15 @@ def sendmessage(message: str='', timeout: str='0') -> None:
     """Sends a message to notification daemon in a separate process.
     urgency=critical makes a message stay until closed manually,
     for other message types types don't forget timeout"""
-
-    icon = '/home/jastix/Documents/icons/gdrive_256.png'
-    subprocess.Popen(['notify-send', '-i', icon, '-t', timeout, 'gdrive sync', message])
+    try:
+        if os_name == 'posix':
+            subprocess.Popen(['notify-send', '-i', './icons/gdrive.png', '-t', timeout, 'gdrive sync', message])
+        else:
+            from win10toast import ToastNotifier
+            toaster = ToastNotifier()
+            toaster.show_toast('gdrive sync', message, icon_path='./icons/gdrive.ico', duration=3, threaded=True)
+    except (FileNotFoundError, ModuleNotFoundError):
+        logger.error('No program to show messages or win10toast module')
 
 def ignore_directory_parser(arg_string: str) -> IgnoreThose:
     """Parses the input arguments like path=<path>,type=<type>
@@ -995,8 +1001,8 @@ def ignore_directory_parser(arg_string: str) -> IgnoreThose:
     # so in a case return didn't happen, something wrong with input values
     except:
         pass
-    raise ArgumentTypeError('Wrong usage, example: --ignore-directories path=<path>,'
-                            'type=<type> --ignore-directories path=<path>,type=<type>')
+    raise ArgumentTypeError('Wrong usage, example: --ignore path=<path>,'
+                            'type=<type> --ignore path=<path>,type=<type>')
 
 if __name__ == '__main__':
     logger = logging.getLogger('mylogger')
@@ -1024,16 +1030,20 @@ if __name__ == '__main__':
         help='If set, a new folder on gdrive will be created for syncing'
     )
     parser.add_argument('--sync-direction', choices=['local_to_gdrive', 'gdrive_to_local'], default='local_to_gdrive')
-    parser.add_argument('--ignore-directories', type=ignore_directory_parser, action='append',
+    parser.add_argument('--ignore', type=ignore_directory_parser, action='append',
                     help='ignore directories with the specified path and type.'
-                    'Format: --ignore-directories path=<path>,type=<type> '
-                    '--ignore-directories path=<path>,type=<type> ... .'
+                    'Format: --ignore path=<path>,type=<type> '
+                    '--ignore path=<path>,type=<type> ... .'
                     '<type>: single_file, all_files, folder'
                     '<path>: RELATIVE path INSIDE the syncing directory')
     args = parser.parse_args()
-    logger.debug(f'syncing with arguments:{args.local_path}, {args.gdrive_dir}, '
-                f'{args.new}, {args.sync_direction}, '
-                f'{[ (x.rel_path, x.obj_type) for x in args.ignore_directories ]}')
+    logger.debug(f'syncing with arguments: local dir - {args.local_path}, '
+                 f'gdrive dir - {args.gdrive_dir}, '
+                 f'sync direction {args.sync_direction}' + 
+                 ', create new dir - ' + args.new if args.new else '' +
+                 ', ignored objects - ' + '; '.join([
+                     f'path={x.rel_path},type={x.obj_type}' for x in args.ignore
+                 ]) if args.ignore else '')
     if path.exists(args.local_path):
         while retries:
             try:
@@ -1043,7 +1053,7 @@ if __name__ == '__main__':
                     gdrive_folder=args.gdrive_dir,
                     create_folder=args.new,
                     sync_direction=args.sync_direction,
-                    ignored_objects=args.ignore_directories
+                    ignored_objects=args.ignore
                 )
                 gdrive.sync()
                 sendmessage(f'{args.gdrive_dir} successfully synced', '10000')
