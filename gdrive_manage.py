@@ -861,11 +861,13 @@ def sendmessage(message: str='', timeout: str='0') -> None:
     for other message types types don't forget timeout"""
     try:
         if os_name == 'posix':
-            subprocess.Popen(['notify-send', '-i', './icons/gdrive.png', '-t', timeout, 'gdrive sync', message])
+            # notify-send accepts only absolute paths, get it
+            script_dir = path.dirname(path.realpath(__file__))
+            subprocess.Popen(['notify-send', '-i', f'{script_dir}/icons/gdrive.png', '-t', timeout, 'gdrive sync', message])
         else:
             from win10toast import ToastNotifier
             toaster = ToastNotifier()
-            toaster.show_toast('gdrive sync', message, icon_path='./icons/gdrive.ico', duration=3, threaded=True)
+            toaster.show_toast('gdrive sync', message, icon_path='icons\\gdrive.ico', duration=3, threaded=True)
     except (FileNotFoundError, ModuleNotFoundError):
         logger.error('No program to show messages or win10toast module')
 
