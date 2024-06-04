@@ -1,3 +1,3 @@
 google-auth-oauthlib
 google-api-python-client
-win10toast; sys_platform != 'posix'
+win10toast; sys_platform == 'win32'

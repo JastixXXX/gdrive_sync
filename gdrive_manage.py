@@ -3,36 +3,39 @@
 # the google drive os-like path, i.e. a path relative to the
 # Google Drive root <foldername>/<innerfolder>/...
 # and a list of objects to not sync
-# With flag -n a new gdrive directory will be created instead of
+# With flag -n --new a new gdrive directory will be created instead of
 # searching an existing one
+# Argument --sync-direction handles file deletions. It has three
+# options: "gdrive_to_local", "local_to_gdrive", "mirror"
 
 # The logic of syncing - go over either local or gdrive files.
 # If anything is newer on a local machine - upload it to gdrive,
 # if anything is newer on gdrive - download to a local machine.
+# Always!
 # But we have to deal with file removal as well
-# So, basically we have three cases:
-# 1. Something is deleted locally - absent on local machine
-# but exists on gdrive
-# 2. Something was added directly to gdrive - also absent on
-# local machine but exsts on gdrive
-# 3. Something was directly deleted from gdrive - it's on
-# the local machine, but not on gdrive and should be deleted
-# from local machine
-# - Solution for 2 is easy: 
-# A helper file will be created on gdrive root. This file will
-# contain the timestamp, when data was synced last time.
-# Thus if there is something not existing locally, but it's
-# newer that last sync timestamp, it should be copied locally
-# - Solution for 1 and 3 isn't that simple.
-# Probably the easiest way is to not delete anything from
-# gdrive manually but we go the other way - sync direction.
-# By default it will be "to gdrive", so nothing will be deleted
-# on a local machine. If it's set "to local", then nothing
-# will be deleted from gdrive
-# The best option to use it - put syncing "to gdrive" on
-# autolaunch, and "to local" at button press. So if during
-# a day there were some deletions from gdrive, just press
-# a button in another location.
+# So, basically we have two cases:
+# 1. Something is deleted locally or added to gdrive - absent on
+# local machine but exists on gdrive
+# 2. Something was deleted from gdrive or added locally - it's on
+# the local machine, but not on gdrive
+# For the purpose to set, what to do with absent files "sync
+# direction" parameter is used. By default it will be "to gdrive",
+# so nothing will be deleted on a local machine.
+# If it's set "to local", then nothing will be deleted from gdrive
+# This is clear behavior, but there is a case: for example
+# we forgot to sync FROM gdrive and begun to sync TO gdrive.
+# If there were new files on gdrive, they will be removed,
+# unlike existing on both drives files, which modification
+# time will be compared and newer files downloaded regardles
+# of the sync direction. To prevent it there is another option -
+# "mirror". If it's set, there will be no
+# deletions in the syncing process. Files, absent on the
+# source will be downloaded, files, absent on the target
+# will be uploaded.
+# The best option to use the script - put syncing "mirror"
+# on autolaunch, and both "local_to_gdrive" and "gdrive_to_local"
+# at button press. So if during a day there were some deletions,
+# just press a button.
 
 import logging
 import subprocess
@@ -44,7 +47,7 @@ from google.auth.exceptions import TransportError, RefreshError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from io import FileIO, BytesIO
 from httplib2 import ServerNotFoundError
 from datetime import datetime, UTC
@@ -162,7 +165,7 @@ class GdriveSync:
         local_folder:str,
         gdrive_folder: str='',
         create_folder: bool=False,
-        sync_direction: Literal['local_to_gdrive', 'gdrive_to_local']='local_to_gdrive',
+        sync_direction: Literal['local_to_gdrive', 'gdrive_to_local', 'mirror']='local_to_gdrive',
         ignored_objects: list[IgnoreThose]|None = None
     ) -> None:
         self.client_secrets_file = client_secrets_file
@@ -178,15 +181,6 @@ class GdriveSync:
         self.create_folder = create_folder
         self.creds = None
         self.service = None
-        # file, containing names and dates of synced directories
-        self.last_sync_file_name = 'sync_data.txt'
-        # file id on gdrive. Stays None if it wasn't found
-        self.last_sync_file_id = None
-        # it's not enough to find a file and get it's
-        # content. It should also have the data about the
-        # folder to sync, i.e. self.folder and it's sync time
-        # set a default of a smallest valuable
-        self.last_sync_time = 0
         # prepare for gdrive folder structure
         self.gdrive_struct = []
         # prepare for local structure
@@ -194,9 +188,7 @@ class GdriveSync:
         # store stuff to ignore
         self.ignored_objects = ignored_objects
         self.sync_direction = sync_direction
-        # when a folder has to be deleted, but has a file
-        # newer than last sync time, the whole dir should be
-        # restored
+        # when mirror is set, the whole dir should be restored
         self.restore_dirs = []
 
     def make_creds(self) -> None:
@@ -468,62 +460,7 @@ class GdriveSync:
         # go over all ignoring items
         for item_to_ignore in self.ignored_objects:
             exclude_one(self.gdrive_struct, item_to_ignore)
-            exclude_one(self.local_struct, item_to_ignore)
-
-    def _get_last_sync_time(self) -> None:
-        """File self.last_sync_file_name is stored in the root
-        of google drive and contains rows with directory and it's
-        sync time timestamp each.
-        """
-        logger.debug(f'Reading {self.last_sync_file_name}')
-        # look for a file on the gdrive root. It should be
-        # either there with exact name or none
-        last_sync_file = self.search_by_name(name=self.last_sync_file_name, parent_folder_id=self.gdrive_folder_id)
-        # there should be just one item or None, so we can safely
-        # take the first item if the list isn't empty
-        if last_sync_file:
-            self.last_sync_file_id = last_sync_file[0]
-            # now we need file content
-            # self.download_file won't be good foor the purpose
-            # because we don't need to store it's content
-            # but to put it into a variable
-            request = self.service.files().get_media(fileId=self.last_sync_file_id)
-            fh = BytesIO()
-            # Initialise a downloader object to download the file 
-            downloader = MediaIoBaseDownload(fh, request) 
-            done = False
-            # Download the data in chunks 
-            while not done: 
-                status, done = downloader.next_chunk() 
-            # rewind stream to the beginning
-            fh.seek(0)
-            # decode from bytes. split two name and timestamp
-            file_content = fh.read().decode()
-            if not file_content.isdigit():
-                logger.error(f'Seems like file {self.last_sync_file_name} is corrupted, a new one will be created')
-                return
-            self.last_sync_time = int(file_content)
-
-    def _set_last_sync_time(self) -> None:
-        """saves file named from self.last_sync_file_name
-        to the gdrive root
-        """
-        logger.debug(f'Setting {self.last_sync_file_name}')
-        self.make_creds()
-        # get timestamp, cut off stuff after dot
-        now = int(datetime.now().timestamp())
-        # prepare inram file
-        file_data = BytesIO(str(now).encode())
-        if self.last_sync_file_id is None:
-            file_metadata = {
-                'name': self.last_sync_file_name,
-                'parents': [self.gdrive_folder_id],
-            }
-            media = MediaIoBaseUpload(file_data, mimetype='text/plain', resumable=True)
-            self.service.files().create(body=file_metadata, media_body=media).execute() 
-        else:
-            media = MediaIoBaseUpload(file_data, mimetype='text/plain', resumable=True)
-            self.service.files().update(fileId=self.last_sync_file_id, media_body=media).execute()        
+            exclude_one(self.local_struct, item_to_ignore)  
 
 # ========== manipulate gdrive ===============
     def create_gdrive_folder(self, folder_name: str, parent_folder_id: str|None=None) -> str:
@@ -695,37 +632,6 @@ class GdriveSync:
             one_gdrive (OneGDriveTier): gdrive directory
             local_dir (str): absolute path to the local directory in fs
         """
-        # --------------- innder func ----------------
-        def find_newest_file(struct: list[OneLocalTier]|list[OneGDriveTier], rel_path: str) -> int:
-            """_summary_
-
-            Args:
-                struct (list[OneLocalTier]|list[OneGDriveTier]): self.local_struct
-                            or self.gdrive_struct
-                rel_path (str): relative path to a folder inside syncing folder,
-                            i.e. inside self.local_folder
-
-            Returns:
-                int: timestamp of newest file
-            """
-            # as a starting point take 0
-            newest_timestamp = 0
-            for item in struct:
-                # if it's not inside a folder of interest
-                if not rel_path in item.parents:
-                    continue
-                # for all files in a folder of interest
-                for file in item.files:
-                    # depends on type we take an item from a tuple
-                    if type(item) is OneLocalTier:
-                        curr_file_timestamp = file[1]
-                    else:
-                        curr_file_timestamp = file[2]
-                    # save the one is bigger
-                    if curr_file_timestamp > newest_timestamp:
-                        newest_timestamp = curr_file_timestamp
-            return newest_timestamp
-        # ----------- end innder func ----------------
         logger.debug(f'Comparing dir {one_local.parents if one_local.parents else "root"}')
         files_to_delete = [] # for bacth delete
         # go over all files in a local dir
@@ -741,7 +647,7 @@ class GdriveSync:
                         # if so - update gdrive file
                         self.update_file(path.join(one_local.parents, local_file), g_id)
                     # check if a remote file is newer
-                    elif g_mtime < local_mtime:
+                    elif g_mtime > local_mtime:
                         # download it to the folder, consisting of a root dir of syncing folder
                         # and it's relative path inside
                         self.download_file(one_local.parents, g_id)
@@ -750,14 +656,11 @@ class GdriveSync:
                     break
             # if a file not found, means it's absent on gdrive
             # thus it should be uploaded if the sync direction is
-            # 'local_to_gdrive' or a file is newer than last sync time
-            # otherwise deleted locally
+            # 'local_to_gdrive' or 'mirror' otherwise deleted locally
             else:
-                if self.sync_direction == 'local_to_gdrive' or local_mtime > self.last_sync_time:
-                    if self.sync_direction == 'gdrive_to_local':
-                        logger.info(f'Local file {path.join(self.local_folder, one_local.parents, local_file)} is '
-                              'newer than last sync time. Thus regardless of sync direction "gdrive to local" '
-                              'the file will be uploaded')                    
+                if self.sync_direction in ['local_to_gdrive', 'mirror']:
+                    logger.info(f'Local file {path.join(self.local_folder, one_local.parents, local_file)} is '
+                        'absent on gdrive')                    
                     self.upload_file(path.join(one_local.parents, local_file), local_mtime, one_gdrive.gparent)
                 else:
                     local_file_to_del = path.join(self.local_folder, one_local.parents, local_file)
@@ -765,14 +668,12 @@ class GdriveSync:
                     remove(local_file_to_del)
         # if anything remins in the list of gdrive files, means these files
         # are absent locally and should be deleted on grdive if sync is
-        # 'local_to_gdrive' unless they are newer than last sync time
-        # if newer or sync direction is 'gdrive_to_local', than download it
+        # 'local_to_gdrive' unless mirror is set. If 'mirror' is set
+        # or sync direction is 'gdrive_to_local', than download it
         for item in one_gdrive.files:
             g_name, g_id, g_mtime = item
-            if g_mtime > self.last_sync_time or self.sync_direction == 'gdrive_to_local':
-                if self.sync_direction == 'local_to_gdrive':
-                    logger.info(f'File {path.join(one_local.parents, g_name)} was downloaded despite sync direction '
-                          'is "local to gdrive" because its absent locally and newer than last sync time')
+            if self.sync_direction in ['gdrive_to_local', 'mirror']:
+                logger.info(f'File {path.join(one_local.parents, g_name)} is absent locally')
                 # download newer file
                 self.download_file(one_local.parents, g_id)
             # or delete from gdrive
@@ -792,17 +693,18 @@ class GdriveSync:
             # dir exists locally, but not on gdrive
             else:
                 inner_dir_rel_path = path.join(one_local.parents, local_dir)
-                # in a case 'local_to_gdrive' we create a folder of current tier
-                # and the rest will be created later diring common sync process
-                # or if it's newer than last sync time, despite 'gdrive_to_local'
-                # we also create a folder, but preserve the path for uploading later
-                if (self.sync_direction == 'local_to_gdrive') or (
-                    find_newest_file(self.local_struct, inner_dir_rel_path) > self.last_sync_time):
+                # in a case 'local_to_gdrive' or 'mirror we create
+                # a folder of current tier and the rest will be created later
+                # diring common sync process
+                if self.sync_direction in ['local_to_gdrive', 'mirror']:
+                    logger.info(f'Dir {inner_dir_rel_path} is absent on gdrive')
                     new_folder = self.create_gdrive_folder(local_dir, one_gdrive.gparent)
                     # new gdrive folder which was created in a process of reflecting
-                    # and should be added to the gdrive structure; such are necessary
-                    # because inner tires of local structure can require it to exist
+                    # should be added to the gdrive structure; such thing is necessary
+                    # because inner tiers of local structure can require it to exist
                     self.gdrive_struct.append(OneGDriveTier(parents=inner_dir_rel_path, gparent=new_folder))
+                    # if the only reason for this dir to be created is mirror,
+                    # it should be restored locally from gdrive
                     if self.sync_direction != 'local_to_gdrive':
                         self.restore_dirs.append(inner_dir_rel_path)
                 # if 'gdrive_to_local' then remove it from local
@@ -812,19 +714,20 @@ class GdriveSync:
         # deal with remaining gdrive dirs
         while one_gdrive.dirs:
             g_name, g_id = one_gdrive.dirs.pop()
-            # delete dirs unless they have a file, newer than last sync
-            if self.sync_direction == 'local_to_gdrive':
-                if find_newest_file(self.gdrive_struct, path.join(one_gdrive.parents, g_name)) < self.last_sync_time:
-                    files_to_delete.append(g_id)
-                # if something is newer inside this folder on gdrive
-                # then create it locally. We should preserve gparent too
-                else:
+            # delete dirs unless 'mirror' is set
+            if self.sync_direction in ['local_to_gdrive', 'mirror']:
+                # if set, preserve this directory for further restoration
+                if self.sync_direction == 'mirror':
                     mkdir(path.join(self.local_folder, one_gdrive.parents, g_name))
                     self.restore_dirs.append(path.join(one_gdrive.parents, g_name))
+                else:
+                    files_to_delete.append(g_id)
             # 'gdrive_to_local' and dir exists only on gdrive
             # a folder has to be created
             else:
-                mkdir(path.join(self.local_folder, one_gdrive.parents, g_name))
+                dir_to_create = path.join(self.local_folder, one_gdrive.parents, g_name)
+                logger.info(f'Dir {dir_to_create} is absent locally, creating')
+                mkdir(dir_to_create)
                 # maybe not required
                 self.local_struct.append(OneLocalTier(path.join(one_gdrive.parents, g_name)))
         # delete all objects marked for this
@@ -872,8 +775,6 @@ class GdriveSync:
             self.gdrive_folder_id = self.create_gdrive_folder(self.gdrive_folder, parent_dir)
         # get the gdrive structure
         self._iterate_gdrive(self.gdrive_folder_id)
-        # get last sync time
-        self._get_last_sync_time()
         # prepare sync_data file for ignoring
         sync_file = IgnoreThose('sync_data.txt', 'single_file')
         # remove all things which should be ignored from both structures
@@ -910,11 +811,11 @@ class GdriveSync:
         # likely there are none, it's rather rare
         # --------------------------------------
         # here we have the opposide direction of syncing
-        # if we have 'local_to_gdrive', it means we met a
-        # way too new folder on gdrive and should download
-        # it instead of erasing.
-        # if we had 'gdrive_to_local', we should upload a
-        # folder instead of erasing
+        # occured because of the mirroring
+        # if we have 'local_to_gdrive', it means there is stuff
+        # existing only on gdrive and should be downloaded
+        # instead of erasing. If we had 'gdrive_to_local',
+        # we should upload a folder instead of erasing
         if self.restore_dirs:
             struct_for_restore = []
             # filter those to restore
@@ -952,7 +853,6 @@ class GdriveSync:
                         for dir in elem.dirs:
                             new_folder = self.create_gdrive_folder(dir, parent_dir_id)
                             self.gdrive_struct.append(OneGDriveTier(parents=path.join(elem.parents, dir), gparent=new_folder))
-        self._set_last_sync_time()
         logger.debug(f'Finish syncing')
 
 def sendmessage(message: str='', timeout: str='0') -> None:
@@ -1012,10 +912,13 @@ if __name__ == '__main__':
         datefmt='%Y-%m-%d %H:%M:%S',
         style='{'
         )
-    # handler = logging.StreamHandler()
-    handler = logging.FileHandler('sync.log', mode='a', encoding=None, delay=False)
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    # make two handlers to have an output in both - file and terminal
+    term_handler = logging.StreamHandler()
+    file_handler = logging.FileHandler('sync.log', mode='a', encoding=None, delay=False)
+    term_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(term_handler)
+    logger.addHandler(file_handler)
 
     retries = 3 # three attempts to sync, in case of network issues
     parser = ArgumentParser()
@@ -1029,7 +932,9 @@ if __name__ == '__main__':
         action="store_true",
         help='If set, a new folder on gdrive will be created for syncing'
     )
-    parser.add_argument('--sync-direction', choices=['local_to_gdrive', 'gdrive_to_local'], default='local_to_gdrive')
+    parser.add_argument('--sync-direction', choices=['local_to_gdrive', 'gdrive_to_local', 'mirror'],
+                        default='local_to_gdrive', help='options to use:'
+                        'local_to_gdrive, gdrive_to_local, mirror')
     parser.add_argument('--ignore', type=ignore_directory_parser, action='append',
                     help='ignore directories with the specified path and type.'
                     'Format: --ignore path=<path>,type=<type> '
@@ -1040,10 +945,10 @@ if __name__ == '__main__':
     logger.debug(f'syncing with arguments: local dir - {args.local_path}, '
                  f'gdrive dir - {args.gdrive_dir}, '
                  f'sync direction {args.sync_direction}' + 
-                 ', create new dir - ' + args.new if args.new else '' +
-                 ', ignored objects - ' + '; '.join([
+                 (', create new dir' if args.new else '') +
+                 (', ignored objects - ' + '; '.join([
                      f'path={x.rel_path},type={x.obj_type}' for x in args.ignore
-                 ]) if args.ignore else '')
+                 ]) if args.ignore else ''))
     if path.exists(args.local_path):
         while retries:
             try:
