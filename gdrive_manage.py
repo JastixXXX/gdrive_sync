@@ -39,6 +39,7 @@
 
 import logging
 import subprocess
+import sys
 from os import path, listdir, remove, mkdir, utime
 from os import name as os_name
 from google.auth.transport.requests import Request
@@ -48,7 +49,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from io import FileIO, BytesIO
+from io import FileIO
 from httplib2 import ServerNotFoundError
 from datetime import datetime, UTC
 from concurrent.futures import TimeoutError
@@ -70,6 +71,25 @@ GOOGLE_LOGIN = {
     'scopes': ['https://www.googleapis.com/auth/drive']
 }
 # =============== end globals ================
+
+# ========= special for pyinstaller ==========
+def resource_path(relative_path, outer_file: bool=False):
+    """Get the absolute path to the resource,
+    works for dev and for PyInstaller
+    
+    outer_file if True - means that a file should be looked for
+    not in the pyinstaller bundle but next to the executable.
+    Does nothing for non pyinstaller env"""
+    try:
+        # PyInstaller creates a temporary folder named _MEIPASS
+        base_path = sys._MEIPASS
+        # if we don't need the MEIPASS directory
+        if outer_file:
+            base_path = path.dirname(sys.executable)
+    except Exception:
+        base_path = path.abspath(".")
+    return path.join(base_path, relative_path)
+# ======== end special for pyinstaller========
 
 class IgnoreThose:
     """this class is for storing paths to files or folders to ignore.
@@ -168,8 +188,9 @@ class GdriveSync:
         sync_direction: Literal['local_to_gdrive', 'gdrive_to_local', 'mirror']='local_to_gdrive',
         ignored_objects: list[IgnoreThose]|None = None
     ) -> None:
-        self.client_secrets_file = client_secrets_file
-        self.token_file = token_file
+        # don't forget to get the actual path from pyinstalled files
+        self.client_secrets_file = resource_path(client_secrets_file, True)
+        self.token_file = resource_path(token_file, True)
         self.scopes = scopes
         # folder name gdrive given by it's human readable path
         self.gdrive_folder = gdrive_folder.strip('/')
@@ -860,14 +881,13 @@ def sendmessage(message: str='', timeout: str='0') -> None:
     urgency=critical makes a message stay until closed manually,
     for other message types types don't forget timeout"""
     try:
+        icons_dir = resource_path('icons')
         if os_name == 'posix':
-            # notify-send accepts only absolute paths, get it
-            script_dir = path.dirname(path.realpath(__file__))
-            subprocess.Popen(['notify-send', '-i', f'{script_dir}/icons/gdrive.png', '-t', timeout, 'gdrive sync', message])
+            subprocess.Popen(['notify-send', '-i', f'{icons_dir}/gdrive.png', '-t', timeout, 'gdrive sync', message])
         else:
             from win10toast import ToastNotifier
             toaster = ToastNotifier()
-            toaster.show_toast('gdrive sync', message, icon_path='icons\\gdrive.ico', duration=3, threaded=True)
+            toaster.show_toast('gdrive sync', message, icon_path=f'{icons_dir}\\gdrive.ico', duration=3, threaded=True)
     except (FileNotFoundError, ModuleNotFoundError):
         logger.error('No program to show messages or win10toast module')
 
@@ -973,7 +993,7 @@ if __name__ == '__main__':
                 sleep(120)
                 retries -= 1
             except Exception as e:
-                logger.error('Unexpected error, interrupted')
+                logger.error(f'Unexpected error, interrupted: {str(e)}')
                 sendmessage(f'{args.gdrive_dir} wasnt synced, an error occured: {str(e)}')
                 break
         else:
