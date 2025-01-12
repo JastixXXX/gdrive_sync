@@ -1,3 +1,4 @@
 google-auth-oauthlib
 google-api-python-client
 win10toast; sys_platform == 'win32'
+pyinstaller
