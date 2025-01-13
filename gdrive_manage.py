@@ -65,7 +65,8 @@ import logging
 import subprocess
 import sys
 import json
-from os import path, listdir, remove, mkdir, utime, walk
+from io import TextIOWrapper
+from os import path, listdir, remove, mkdir, utime, walk, _exit
 from os import name as os_name
 from os import sep as os_sep
 from google.auth.transport.requests import Request
@@ -638,11 +639,11 @@ class GdriveSync:
         """
         logger.info(f'(local) -> (gdrive) updating file {path.basename(local_path)}')
         self.make_creds()
-        # full_path = path.join(self.local_folder, local_path)
-        media = MediaFileUpload(path.join(self.local_folder, local_path), resumable=True)
+        full_path = path.join(self.local_folder, local_path)
+        media = MediaFileUpload(full_path, resumable=True)
         # Get the current modification time of the local file
         if not mtime:
-            mtime = int(path.getmtime(local_path))     
+            mtime = int(path.getmtime(full_path))     
         mtime_iso = datetime.fromtimestamp(mtime, UTC).isoformat()   
         # Update the file metadata and media
         self.service.files().update(
@@ -1236,10 +1237,13 @@ class GdriveSync:
                 self.upload_file(file, parent=dir_id)        
 
 
-def sendmessage(message: str='', timeout: str='0') -> None:
+def sendmessage(off_messages: bool=False, message: str='', timeout: str='0') -> None:
     """Sends a message to notification daemon in a separate process.
     urgency=critical makes a message stay until closed manually,
     for other message types types don't forget timeout"""
+    # exit if messages aren't needed
+    if off_messages:
+        return
     try:
         icons_dir = resource_path('icons')
         if os_name == 'posix':
@@ -1287,6 +1291,11 @@ def ignore_directory_parser(arg_string: str) -> IgnoreThose:
                             'type=<type> --ignore path=<path>,type=<type>')
 
 if __name__ == '__main__':
+    # Force stdout and stderr to use UTF-8 to prevent gibberish
+    # in cyrillic on windows
+    sys.stdout = TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
     logger = logging.getLogger('mylogger')
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter(
@@ -1322,10 +1331,16 @@ if __name__ == '__main__':
         help='filesystem-like path on gdrive. Same pattern as for local directory')
     # if a new gdrive folder should be created regardless of it's existance
     parser.add_argument(
-        "-n",
-        "--new",
-        action="store_true",
+        '-n',
+        '--new',
+        action='store_true',
         help='If set, a new folder on gdrive will be created for syncing'
+    )
+    # if called from another script, which handles notifications, turn it off here
+    parser.add_argument(
+        '--off_notifications',
+        action='store_true',
+        help='If set, no notifications will pop up'
     )
     parser.add_argument('--sync-direction',
                         choices=[
@@ -1352,16 +1367,16 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # args = parser.parse_args([
-    #     '/home/jastix/Documents/temp/1/remotevault/testVault',
-    #     'testVault',
+    #     '/home/jastix/Documents/ObsidianVault',
+    #     'ObsidianVault',
     #     '--mode',
     #     'partial_update',
     #     '--actions_json',
-    #     '{"rename":{"321/9087/aaaaa":"321/9087/aaaaa1"}}'
+    #     '{"update_file":["Obsidian/Создание obsidian plugin.md"]}'
     # ])
     # args = parser.parse_args([
-    #     '/home/jastix/Documents/temp/TestVault',
-    #     'TestVault',
+    #     '/home/jastix/Documents/ObsidianVault',
+    #     'ObsidianVault',
     #     '--ignore',
     #     'path=.obsidian,type=folder',
     #     '--sync-direction',
@@ -1388,7 +1403,7 @@ if __name__ == '__main__':
     # exit if interactive mode and no local folder for syncing
     if not path.exists(args.local_path):
         logger.error('No local folder')
-        sendmessage(f'{args.local_path} doesnt exist locally')
+        sendmessage(args.off_notifications, f'{args.local_path} doesnt exist locally')
         exit()
     while retries:
         try:
@@ -1400,7 +1415,7 @@ if __name__ == '__main__':
                     gdrive_folder=args.gdrive_dir
                 )
                 gdrive.sync_partial(args.actions_json)
-                sendmessage('Partial sync was successfully applied', '10000')
+                sendmessage(args.off_notifications, 'Partial sync was successfully applied', '10000')
                 logger.info('All done well\n-----------------------')                
                 # the work is done, don't allow retries
                 break
@@ -1415,21 +1430,21 @@ if __name__ == '__main__':
                     ignored_objects=args.ignore
                 )
                 gdrive.sync()
-                sendmessage(f'{args.gdrive_dir} successfully synced', '10000')
+                sendmessage(args.off_notifications, f'{args.gdrive_dir} successfully synced', '10000')
                 logger.info('All done well\n-----------------------')
                 # the work is done, don't allow retries
-                break
+                _exit(0)  # 0 for success, windows requires
         # if issues are related exactly to the network then wait and retry
         except (TimeoutError, TransportError, ServerNotFoundError, RefreshError):
-            sendmessage(f'{args.gdrive_dir} wasnt synced, probably network issues, will retry', '10000')
+            sendmessage(args.off_notifications, f'{args.gdrive_dir} wasnt synced, probably network issues, will retry', '10000')
             logger.error('Network error, retrying')
             sleep(120)
             retries -= 1
         # not a network related error
         except Exception as e:
             logger.error(f'Unexpected error, interrupted: {str(e)}')
-            sendmessage(f'{args.gdrive_dir} wasnt synced, an error occured: {str(e)}')
+            sendmessage(args.off_notifications, f'{args.gdrive_dir} wasnt synced, an error occured: {str(e)}')
             break
     else:
         logger.critical('Network error, out of retries')
-        sendmessage(f'{args.gdrive_dir} wasnt synced, probably network issues, retries are over')
+        sendmessage(args.off_notifications, f'{args.gdrive_dir} wasnt synced, probably network issues, retries are over')
