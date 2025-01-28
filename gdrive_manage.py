@@ -359,7 +359,7 @@ class GdriveSync:
                         if gdrive_dir_id_cache is not None:
                             ready_chain = path.join(ready_chain, item)
                             gdrive_dir_id_cache[ready_chain] = parent_folder_id
-                    break
+                break
         # log if found. If it was created - another function logs it
         if dir_exists:
             logger.info(f'Found{" VAULT" if vault_dir else ""} directory {gdrive_path} on gdrive')
@@ -920,23 +920,6 @@ class GdriveSync:
             g_name, g_id = one_gdrive.dirs.pop()
             # if 'local_to_gdrive' or 'ask' with user desire to delete
             # delete those dirs on gdrive
-            # --------------------- old -----------------
-            # if self.sync_direction in ['local_to_gdrive', 'mirror']:
-            #     # if set, preserve this directory for further restoration
-            #     if self.sync_direction == 'mirror':
-            #         mkdir(path.join(self.local_folder, one_gdrive.parents, g_name))
-            #         self.restore_dirs.append(path.join(one_gdrive.parents, g_name))
-            #     else:
-            #         files_to_delete.append(g_id)
-            # # 'gdrive_to_local' and dir exists only on gdrive
-            # # a folder has to be created
-            # else:
-            #     dir_to_create = path.join(self.local_folder, one_gdrive.parents, g_name)
-            #     logger.info(f'Dir {dir_to_create} is absent locally, creating')
-            #     mkdir(dir_to_create)
-            #     # maybe not required
-            #     self.local_struct.append(OneLocalTier(path.join(one_gdrive.parents, g_name)))
-            # --------------------- old ----------------- 
             gdrive_rel_dir_path = path.join(one_gdrive.parents, g_name)  
             # ask for the user input, if True - create a file
             if self.sync_direction == 'ask':
@@ -1045,29 +1028,6 @@ class GdriveSync:
             for item in sorted(tiers.keys()):
                 for elem in tiers[item]:
                     logger.info(f'Restoring dir structure {elem.parents}')
-                    # --------------------- old -----------------
-                    # # processing the opposite situation, so if general option
-                    # # is 'local_to_gdrive', then for us now it's 'gdrive_to_local'
-                    # if self.sync_direction == 'local_to_gdrive':
-                    #     # get all files, remembering that file is a tuple (name, id, mtime)
-                    #     for file in elem.files:
-                    #         self.download_file(elem.parents, file[1])
-                    #     for dir in elem.dirs:
-                    #         mkdir(path.join(self.local_folder, elem.parents, dir[0]))
-                    # # 'gdrive_to_local', so it's basically 'local_to_gdrive' here
-                    # else:
-                    #     # have to find a parent dir first.
-                    #     # if there were no issues before, it has to exist
-                    #     for dir in self.gdrive_struct:
-                    #         if dir.parents == elem.parents:
-                    #             parent_dir_id = dir.gparent
-                    #             break
-                    #     for file in elem.files:
-                    #         self.upload_file(path.join(elem.parents, file[0],), file[1], parent_dir_id)
-                    #     for dir in elem.dirs:
-                    #         new_folder = self.create_gdrive_folder(dir, parent_dir_id)
-                    #         self.gdrive_struct.append(OneGDriveTier(parents=path.join(elem.parents, dir), gparent=new_folder))
-                    # --------------------- old -----------------
                     # have to find a parent dir first.
                     # if there were no issues before, it has to exist
                     for dir in self.gdrive_struct:
@@ -1174,6 +1134,8 @@ class GdriveSync:
                     gdrive_dir_id_cache=gdrive_dir_id_cache,
                     dont_create_chain=True
                 )
+                # init the var
+                file_id = None;
                 # if the directory exists, look for a file/dir
                 if old_exists:
                     file_id = self.search_by_name(path.basename(file), old_dir_id, 'any')
@@ -1183,7 +1145,7 @@ class GdriveSync:
                     gdrive_dir_id_cache=gdrive_dir_id_cache
                 )    
                 # if file/dir exists, move it, otherwise upload from the pc
-                if file_id:    
+                if file_id is not None:    
                     if len(file_id) > 1:
                         logger.info(f'(gdrive) !!! warning, found several files {file} on gdrive')                
                     self.move_file_or_folder(file_id[0], new_dir_id, file, actions['move'][file])
@@ -1372,7 +1334,7 @@ if __name__ == '__main__':
     #     '--mode',
     #     'partial_update',
     #     '--actions_json',
-    #     '{"update_file":["Obsidian/Создание obsidian plugin.md"]}'
+    #     '{"rename":{"321/9087/11aaaaa11111":"321/9087/1111aaaaa11111"},"move":{"321/9087/11aaaaa11111/as123412.md":"321/9087/1111aaaaa11111/as123412.md","321/9087/123.md":"321/9087/1111aaaaa11111/123.md"}}'
     # ])
     # args = parser.parse_args([
     #     '/home/jastix/Documents/ObsidianVault',
