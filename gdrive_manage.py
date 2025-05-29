@@ -1034,6 +1034,10 @@ class GdriveSync:
                         if dir.parents == elem.parents:
                             parent_dir_id = dir.gparent
                             break
+                    # unlikely there is no parent dir id, but juste in case this check
+                    else:
+                        logger.error(f'Parent directory ID is absent for {elem.parents}, this should not happen!')
+                        continue
                     for file in elem.files:
                         # ask for the user input, if True - create a file
                         if self.sync_direction == 'ask':
@@ -1042,7 +1046,7 @@ class GdriveSync:
                         self.upload_file(path.join(elem.parents, file[0],), file[1], parent_dir_id)
                     for dir in elem.dirs:                        # ask for the user input, if True - create a file
                         if self.sync_direction == 'ask':
-                            if not self._ask_user_create(path.join(elem.parents, file[0]), absent_locally=False, file_is_dir=True):
+                            if not self._ask_user_create(path.join(elem.parents, dir), absent_locally=False, file_is_dir=True):
                                 continue
                         new_folder = self.create_gdrive_folder(dir, parent_dir_id)
                         self.gdrive_struct.append(OneGDriveTier(parents=path.join(elem.parents, dir), gparent=new_folder))
@@ -1328,6 +1332,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    ### debug ###
     # args = parser.parse_args([
     #     '/home/jastix/Documents/ObsidianVault',
     #     'ObsidianVault',
@@ -1337,12 +1342,12 @@ if __name__ == '__main__':
     #     '{"rename":{"321/9087/11aaaaa11111":"321/9087/1111aaaaa11111"},"move":{"321/9087/11aaaaa11111/as123412.md":"321/9087/1111aaaaa11111/as123412.md","321/9087/123.md":"321/9087/1111aaaaa11111/123.md"}}'
     # ])
     # args = parser.parse_args([
-    #     '/home/jastix/Documents/ObsidianVault',
-    #     'ObsidianVault',
+    #     'C:\\Users\\User\\Documents\\tmpVault',
+    #     'tmpVault',
     #     '--ignore',
-    #     'path=.obsidian,type=folder',
+    #     'path=.obsidian,type=all_files',
     #     '--sync-direction',
-    #     'mirror'
+    #     'ask'
     # ])
 
     # Post-parsing validation
